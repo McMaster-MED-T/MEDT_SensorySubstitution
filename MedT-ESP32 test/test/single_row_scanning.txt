@@ -1,0 +1,60 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+const uint8_t rowPins[4] = {23, 19, 18, 5};
+const uint8_t colChannels[4] = {8, 9, 10, 11};
+
+void allRowsOff() {
+  for (int i = 0; i < 4; i++) digitalWrite(rowPins[i], LOW);
+}
+
+void allColsOff() {
+  for (int c = 0; c < 4; c++) pwm.setPWM(colChannels[c], 0, 4095);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  pwm.begin();
+  pwm.setPWMFreq(1000);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(rowPins[i], OUTPUT);
+  }
+
+  allRowsOff();
+  allColsOff();
+}
+
+void loop() {
+  allRowsOff();
+  allColsOff();
+
+  for (int c = 0; c < 4; c++) pwm.setPWM(colChannels[c], 0, 0);
+  digitalWrite(rowPins[0], HIGH);
+  delay(500);
+
+  allRowsOff();
+  allColsOff();
+
+  for (int c = 0; c < 4; c++) pwm.setPWM(colChannels[c], 0, 0);
+  digitalWrite(rowPins[1], HIGH);
+  delay(500);
+
+  allRowsOff();
+  allColsOff();
+
+  for (int c = 0; c < 4; c++) pwm.setPWM(colChannels[c], 0, 0);
+  digitalWrite(rowPins[2], HIGH);
+  delay(500);
+
+  allRowsOff();
+  allColsOff();
+
+  for (int c = 0; c < 4; c++) pwm.setPWM(colChannels[c], 0, 0);
+  digitalWrite(rowPins[3], HIGH);
+  delay(500);
+}

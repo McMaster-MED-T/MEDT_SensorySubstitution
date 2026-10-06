@@ -1,0 +1,155 @@
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <ArduinoJson.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+
+// Rows on ESP32
+const uint8_t rowPins[4] = {23, 19, 18, 5};
+
+// Columns on PCA9685
+const uint8_t colChannels[4] = {8, 9, 10, 11};
+
+// Confirmed polarity
+const uint8_t ROW_ACTIVE = HIGH;
+const uint8_t ROW_INACTIVE = LOW;
+
+const uint16_t COL_ON = 0;
+const uint16_t COL_OFF = 4095;
+
+// Playback buffer
+const int MAX_FRAMES = 5000;
+int states[MAX_FRAMES];
+int numFrames = 0;
+float fps = 30.0f;
+unsigned long frameDelayMs = 33;
+int currentFrameIndex = 0;
+unsigned long lastFrameStep = 0;
+bool readyToPlay = false;
+
+void disableAllRows() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(rowPins[i], ROW_INACTIVE);
+  }
+}
+
+void clearAllColumns() {
+  for (int c = 0; c < 4; c++) {
+    pwm.setPWM(colChannels[c], 0, COL_OFF);
+  }
+}
+
+void applyState(int state) {
+  if (state < 0 || state > 3) return;
+
+  // turn everything off first
+  disableAllRows();
+  clearAllColumns();
+
+  // turn all 4 columns on
+  for (int c = 0; c < 4; c++) {
+    pwm.setPWM(colChannels[c], 0, COL_ON);
+  }
+
+  // turn on exactly one row
+  digitalWrite(rowPins[state], ROW_ACTIVE);
+
+  Serial.print("Applying state: ");
+  Serial.println(state);
+}
+
+void loadPayloadFromSerial(const String& msg) {
+  StaticJsonDocument<32768> doc;
+  DeserializationError err = deserializeJson(doc, msg);
+
+  if (err) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  fps = doc["fps"] | 30.0f;
+  int reportedFrames = doc["num_frames"] | 0;
+
+  JsonArray arr = doc["states"].as<JsonArray>();
+  int i = 0;
+  for (int value : arr) {
+    if (i < MAX_FRAMES) {
+      states[i++] = value;
+    }
+  }
+
+  numFrames = i;
+
+  if (reportedFrames != numFrames) {
+    Serial.print("Warning: reported num_frames=");
+    Serial.print(reportedFrames);
+    Serial.print(", loaded=");
+    Serial.println(numFrames);
+  }
+
+  if (fps <= 0.0f) fps = 30.0f;
+  frameDelayMs = (unsigned long)(1000.0f / fps);
+
+  currentFrameIndex = 0;
+  lastFrameStep = millis();
+  readyToPlay = (numFrames > 0);
+
+  if (readyToPlay) {
+    applyState(states[0]);
+    Serial.println("Sequence loaded.");
+    Serial.print("FPS: ");
+    Serial.println(fps);
+    Serial.print("Frames: ");
+    Serial.println(numFrames);
+    Serial.print("Frame delay (ms): ");
+    Serial.println(frameDelayMs);
+  } else {
+    Serial.println("No states loaded.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Wire.begin();
+  pwm.begin();
+  pwm.setPWMFreq(1000);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(rowPins[i], OUTPUT);
+    digitalWrite(rowPins[i], ROW_INACTIVE);
+  }
+
+  clearAllColumns();
+  disableAllRows();
+
+  Serial.println("ESP32 matrix receiver ready.");
+  Serial.println("Waiting for JSON payload...");
+
+  // debug test
+  applyState(1);
+  readyToPlay = false;
+}
+
+void loop() {
+  if (Serial.available()) {
+    String msg = Serial.readStringUntil('\n');
+    msg.trim();
+    if (msg.length() > 0) {
+      loadPayloadFromSerial(msg);
+    }
+  }
+
+  if (readyToPlay && currentFrameIndex < numFrames) {
+    unsigned long now = millis();
+    if (now - lastFrameStep >= frameDelayMs) {
+      applyState(states[currentFrameIndex]);
+      currentFrameIndex++;
+      lastFrameStep = now;
+    }
+  }
+}
