@@ -1,105 +1,133 @@
-import cv2
-import torch
-import numpy as np
-from transformers import pipeline
-from PIL import Image
-import serial
-import time
 
-# Used with Camo Cam or some other phone livestreaming app combinatation 
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
 
-#Change COM5 to whatever ESP32 is connected to:
-esp32 = serial.Serial("COM5", 115200, timeout=1)
-time.sleep(2)  # ESP32 may reset when serial connects
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
-MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+const int num_rows = 4;
+const int num_cols = 4;
+const int rowPins[num_rows] = {23, 19, 18, 5};
+const int colChannels[num_cols] = {8, 9, 10, 11};
 
-device = 0 if torch.cuda.is_available() else -1
-depth_estimator = pipeline(
-    "depth-estimation",
-    model=MODEL,
-    device=device
-)
+int num_LED = num_rows*num_cols;
 
-cap = cv2.VideoCapture(0)
+int depthGrid[16] = {0};
 
-if not cap.isOpened():
-    raise RuntimeError("Could not open camera")
+char inputBuffer[128];
+int inputIndex = 0;
 
-last_send = 0
-while True:
-    ok, frame = cap.read()
-    if not ok:
-        break
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(5);
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(rgb)
+  Wire.begin();
+  pwm.begin();
+  pwm.setPWMFreq(1000);
 
-    result = depth_estimator(pil_image) 
+  for (int r = 0; r < 4; r++) {
+    pinMode(rowPins[r], OUTPUT);
+    digitalWrite(rowPins[r], LOW);
+  }
 
-    depth = np.array(result["depth"], dtype=np.float32)
+  // All columns OFF (active-low LED convention).
+  for (int c = 0; c < 4; c++) {
+    pwm.setPin(colChannels[c], 4096);
+  }
+}
 
+void receiveDepthData() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\n') {
+      inputBuffer[inputIndex] = '\0';
 
-# depth is the raw depth map from your AI model (a NumPy array)
+      int newValues[num_LED];
+      int count = 0;
 
-    h, w = depth.shape
+      char* token = strtok(inputBuffer, ",");
+      bool valid = true;
 
-    # Normalize the entire depth map to 0–100%.
-    depth_min = float(depth.min())
-    depth_max = float(depth.max())
-    depth_range = depth_max - depth_min
+      while (token != nullptr && count < num_LED) {
+        char* endPtr;
+        long v = strtol(token, &endPtr, 10);
 
-    if depth_range > 1e-8:
-        depth_percent = (depth - depth_min) / depth_range * 100.0
-    else:
-        depth_percent = np.zeros_like(depth, dtype=np.float32)
+        if (endPtr == token || *endPtr != '\0' ||
+            v < 0 || v > 100) {
+          valid = false;
+          break;
+        }
 
-    # Create the heat map.
-    visual = (depth_percent * 2.55).clip(0, 255).astype(np.uint8)
-    visual = cv2.applyColorMap(visual, cv2.COLORMAP_INFERNO)
+        newValues[count++] = (int)v;
+        token = strtok(nullptr, ",");
+      }
 
-    
+      if (valid && count == num_LED && token == nullptr) {
+        for (int i = 0; i < num_LED; i++) {
+          depthGrid[i] = newValues[i];
+        }
+      }
 
-    # Calculate average depth for each of the 16 squares,
-    # then apply the arctangent transformation.
-    h, w = depth_percent.shape
-    grid_values = []
+      inputIndex = 0;
+    }
+    else if (ch != '\r') {
+      if (inputIndex < (int)sizeof(inputBuffer) - 1) {
+        inputBuffer[inputIndex++] = ch;
+      } else {
+        inputIndex = 0;  // Discard an oversized packet.
+      }
+    }
+  }
+}
 
-    for row in range(4):
-        for col in range(4):
-            y1, y2 = row * h // 4, (row + 1) * h // 4
-            x1, x2 = col * w // 4, (col + 1) * w // 4
+void setColumnBrightness(int channel, int percent) {
+  percent = constrain(percent, 0, 100);
 
-            average = float(np.mean(depth_percent[y1:y2, x1:x2]))
+  // Convert 0–100% to 0–4096 PWM counts.
+  int brightness = (percent * 4096L) / 100;
 
-            # Convert percentage (0–100) to normalized x (0–1).
-            x = average / 100.0
+  // Your LEDs are active-low:
+  // setPin(channel, 0)    = ON
+  // setPin(channel, 4096) = OFF
+  //
+  // Invert the PWM duty so a larger percentage
+  // produces a brighter LED.
+  if (brightness >= 4096) {
+    pwm.setPin(channel, 0);       // Fully ON
+  }
+  else if (brightness <= 0) {
+    pwm.setPin(channel, 4096);   // Fully OFF
+  }
+  else {
+    pwm.setPin(channel, 4096 - brightness);
+  }
+}
 
-            # Apply your arctangent transformation.
-            z = np.arctan(15 * (x - 0.5)) / np.pi + 0.5
+void loop() {
+  receiveDepthData();
 
-            # Convert back to percentage (0–100) for the ESP32.
-            transformed_percent = round(z * 100)
+  // Multiplex the four rows.
+  for (int row = 0; row < num_rows; row++) {
+    // Turn off all rows before changing columns.
+    for (int r = 0; r < num_rows; r++) {
+      
+      digitalWrite(rowPins[r], LOW);
+    }
 
-            grid_values.append(transformed_percent)
-    # Send 16 comma-separated percentages over USB serial.
-    now = time.monotonic()
+    // Each row's four percentages control its LEDs.
+    for (int col = 0; col < num_cols; col++) {
+      //transposes the heat maps' output:
+      int ledIndex = row + 4*col;
+      setColumnBrightness(
+        colChannels[col],
+        depthGrid[ledIndex]
+      );
+    }
 
-    if now - last_send >= 0.05:
-        packet = ",".join(map(str, grid_values)) + "\n"
-        esp32.write(packet.encode("ascii"))
-        last_send = now
+    // Activate the selected row.
+    digitalWrite(rowPins[row], HIGH);
+    delayMicroseconds(1000);
+    digitalWrite(rowPins[row], LOW);
 
-
-
-    cv2.imshow("16-Square Relative Depth (%)", visual)
-
-
-    cv2.imshow("Live camera", frame)
-    cv2.imshow("AI depth map", visual)
-
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+    receiveDepthData();
+  }
+}
