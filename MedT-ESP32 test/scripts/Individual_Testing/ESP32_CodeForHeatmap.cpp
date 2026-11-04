@@ -1,6 +1,8 @@
 
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
@@ -15,6 +17,11 @@ int depthGrid[16] = {0};
 
 char inputBuffer[128];
 int inputIndex = 0;
+
+bool discardInputLine = false;  // Discard an oversized line through its newline.
+const int depthIntensity[3] = {25, 60, 100};  // PWM intensity levels.
+const uint32_t blinkHalfPeriodMs[3] = {500, 250, 125};  // 1, 2, 4 Hz respectively.
+uint8_t brightnessGrid[16] = {0};
 
 void setup() {
   Serial.begin(115200);
@@ -41,39 +48,47 @@ void receiveDepthData() {
     if (ch == '\n') {
       inputBuffer[inputIndex] = '\0';
 
-      int newValues[num_LED];
-      int count = 0;
+      if (!discardInputLine && inputIndex > 0) {
+#if ARDUINOJSON_VERSION_MAJOR == 7
+        JsonDocument doc;
+#else
+        StaticJsonDocument<JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(16) + 64> doc;
+#endif
+        bool valid = !deserializeJson(doc, inputBuffer);
+        JsonArrayConst states = doc["states"].as<JsonArrayConst>();
+        valid = valid && doc["frame_id"].is<uint32_t>() && states.size() == 16;
 
-      char* token = strtok(inputBuffer, ",");
-      bool valid = true;
-
-      while (token != nullptr && count < num_LED) {
-        char* endPtr;
-        long v = strtol(token, &endPtr, 10);
-
-        if (endPtr == token || *endPtr != '\0' ||
-            v < 0 || v > 100) {
-          valid = false;
-          break;
+        int newValues[16];
+        for (int i = 0; valid && i < num_LED; i++) {
+          if (!states[i].is<uint8_t>()) {
+            valid = false;
+            break;
+          }
+          uint8_t state = states[i].as<uint8_t>();
+          if ((state >> 2) > 2 || (state & 3) > 2) {
+            valid = false;
+            break;
+          }
+          newValues[i] = state;
         }
 
-        newValues[count++] = (int)v;
-        token = strtok(nullptr, ",");
-      }
-
-      if (valid && count == num_LED && token == nullptr) {
-        for (int i = 0; i < num_LED; i++) {
-          depthGrid[i] = newValues[i];
+        if (valid) {
+          for (int i = 0; i < num_LED; i++) {
+            brightnessGrid[i] = newValues[i] >> 2;
+            depthGrid[i] = depthIntensity[newValues[i] & 3];
+          }
         }
       }
 
       inputIndex = 0;
+      discardInputLine = false;
     }
-    else if (ch != '\r') {
-      if (inputIndex < (int)sizeof(inputBuffer) - 1) {
-        inputBuffer[inputIndex++] = ch;
+    else if (!discardInputLine) {
+      if (ch == '\0' || inputIndex >= (int)sizeof(inputBuffer) - 1) {
+        discardInputLine = true;  // Discard through LF, including overflow tails.
+        inputIndex = 0;
       } else {
-        inputIndex = 0;  // Discard an oversized packet.
+        inputBuffer[inputIndex++] = ch;  // Accept CRLF as JSON whitespace.
       }
     }
   }
@@ -118,11 +133,13 @@ void loop() {
     for (int col = 0; col < num_cols; col++) {
       //transposes the heat maps' output:
       int ledIndex = row + 4*col;
+      bool blinkOn = (millis() / blinkHalfPeriodMs[brightnessGrid[ledIndex]]) % 2 == 0;
+      int visiblePercent = blinkOn ? depthGrid[ledIndex] : 0;
       setColumnBrightness(
         colChannels[col],
-        depthGrid[ledIndex]
+        visiblePercent
       );
-      if(depthGrid[ledIndex]>0){flag_turn_on_row = 1;}
+      if(visiblePercent>0){flag_turn_on_row = 1;}
     }
 
     // Activate the selected row.
