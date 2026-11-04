@@ -5,6 +5,7 @@ from transformers import pipeline
 from PIL import Image
 import serial
 import time
+import json
 
 # Used with Camo Cam or some other phone livestreaming app combinatation 
 
@@ -27,6 +28,7 @@ cap = cv2.VideoCapture(1)
 if not cap.isOpened():
     raise RuntimeError("Could not open camera")
 
+frame_id = 0
 last_send = 0
 while True:
     ok, frame = cap.read()
@@ -45,6 +47,9 @@ while True:
 
     h, w = depth.shape
     grid_values = []
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray_h, gray_w = gray.shape
+    states = []
 
     # Normalize the entire depth map to 0–100%.
     depth_min = float(depth.min())
@@ -84,6 +89,26 @@ while True:
                 transformed_percent = 0
             if transformed_percent > 90:
                 transformed_percent = 100
+            # Match the same image region using the webcam's own dimensions, classify brightness and depth
+            gy1, gy2 = row * gray_h // 4, (row + 1) * gray_h // 4
+            gx1, gx2 = col * gray_w // 4, (col + 1) * gray_w // 4
+            mean_gray = float(np.mean(gray[gy1:gy2, gx1:gx2]))
+
+            if mean_gray < 85:
+                brightness_level = 0
+            elif mean_gray < 170:
+                brightness_level = 1
+            else:
+                brightness_level = 2
+
+            if transformed_percent < 33:
+                depth_level = 0
+            elif transformed_percent < 67:
+                depth_level = 1
+            else:
+                depth_level = 2
+
+            states.append((brightness_level << 2) | depth_level)
 
             # Find the center of the square.
             center_x = (x1 + x2) // 2
@@ -129,8 +154,10 @@ while True:
     now = time.monotonic()
 
     if now - last_send >= 0.05:
-        packet = ",".join(map(str, grid_values)) + "\n"
+        packet = json.dumps({"frame_id": frame_id, "states": states},
+                            separators=(",", ":")) + "\n"
         esp32.write(packet.encode("ascii"))
+        frame_id += 1
         last_send = now
 
 
