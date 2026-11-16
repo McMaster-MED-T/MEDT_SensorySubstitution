@@ -5,8 +5,56 @@ from transformers import pipeline
 from PIL import Image
 import serial
 import time
-import json
+import struct
 
+PROTOCOL_VERSION = 1
+PACKET_HEADER = struct.Struct("<BHB")  # Version, uint16 frame ID, patch count.
+VALID_STATES = (0, 1, 2, 4, 5, 6, 8, 9, 10)
+
+
+def pack_states(states):
+    if not 2 <= len(states) <= 254 or len(states) % 2:
+        raise ValueError("Expected an even patch count between 2 and 254")
+    if any(state not in VALID_STATES for state in states):
+        raise ValueError("Invalid four-bit patch state")
+    return bytes(
+        (states[i] << 4) | states[i + 1]
+        for i in range(0, len(states), 2)
+    )
+
+
+def crc8(data):
+    crc = 0
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x07) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc
+
+
+def build_packet(frame_id, states):
+    packed = pack_states(states)
+    payload = PACKET_HEADER.pack(PROTOCOL_VERSION, frame_id, len(states)) + packed
+    raw = payload + bytes([crc8(payload)])
+
+    # Each version-1 payload is at most 132 bytes, so every COBS run fits
+    # in one code byte. Reserve that byte and fill it when the run ends.
+    encoded = bytearray([0])
+    code_index = 0
+    for byte in raw:
+        if byte == 0:
+            encoded[code_index] = len(encoded) - code_index
+            code_index = len(encoded)
+            encoded.append(0)
+        else:
+            encoded.append(byte)
+    encoded[code_index] = len(encoded) - code_index
+    encoded.append(0)  # Serial packet delimiter.
+    return bytes(encoded)
+    
 # Used with Camo Cam or some other phone livestreaming app combinatation 
 
 #Change COM5 to whatever ESP32 is connected to:
@@ -154,10 +202,9 @@ while True:
     now = time.monotonic()
 
     if now - last_send >= 0.05:
-        packet = json.dumps({"frame_id": frame_id, "states": states},
-                            separators=(",", ":")) + "\n"
-        esp32.write(packet.encode("ascii"))
-        frame_id += 1
+        packet = build_packet(frame_id, states)
+        esp32.write(packet)
+        frame_id = (frame_id + 1) & 0xFFFF
         last_send = now
 
 
