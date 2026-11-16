@@ -2,7 +2,6 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 #include <Arduino.h>
-#include <ArduinoJson.h>
 
 Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
 
@@ -11,17 +10,24 @@ const int num_cols = 4;
 const int rowPins[num_rows] = {23, 19, 18, 5};
 const int colChannels[num_cols] = {8, 9, 10, 11};
 
-int num_LED = num_rows*num_cols;
+const int num_LED = num_rows*num_cols;
 
-int depthGrid[16] = {0};
+int depthGrid[num_LED] = {0};
 
-char inputBuffer[128];
+// Raw layout: version, frame ID (2 bytes, little-endian), patch count,
+// packed patch pairs (upper nibble first), CRC-8. COBS adds one byte.
+constexpr uint8_t protocolVersion = 1;
+constexpr int headerSize = 4;
+constexpr int rawPacketSize = headerSize + num_LED / 2 + 1;
+constexpr int encodedPacketSize = rawPacketSize + 1;
+static_assert(num_LED > 0 && num_LED <= 254 && num_LED % 2 == 0,
+              "Packet format requires an even patch count from 2 to 254");
+uint8_t inputBuffer[encodedPacketSize];
 int inputIndex = 0;
-
-bool discardInputLine = false;  // Discard an oversized line through its newline.
+bool discardInputPacket = false;
 const int depthIntensity[3] = {25, 60, 100};  // PWM intensity levels.
 const uint32_t blinkHalfPeriodMs[3] = {500, 250, 125};  // 1, 2, 4 Hz respectively.
-uint8_t brightnessGrid[16] = {0};
+uint8_t brightnessGrid[num_LED] = {0};
 
 void setup() {
   Serial.begin(115200);
@@ -42,53 +48,73 @@ void setup() {
   }
 }
 
+uint8_t crc8(const uint8_t* data, int length) {
+  uint8_t crc = 0;
+  for (int i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      if (crc & 0x80) {
+        crc = (crc << 1) ^ 0x07;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void applyPacket() {
+  if (inputIndex != encodedPacketSize) return;
+
+  uint8_t raw[rawPacketSize];
+  int readIndex = 0;
+  int writeIndex = 0;
+  while (readIndex < inputIndex) {
+    uint8_t code = inputBuffer[readIndex++];
+    if (code == 0) return;
+    int runLength = code - 1;
+    if (runLength > inputIndex - readIndex || runLength > rawPacketSize - writeIndex) return;
+    for (int i = 0; i < runLength; i++) {
+      raw[writeIndex++] = inputBuffer[readIndex++];
+    }
+    // Packets are shorter than 254 bytes, so a following run marks a zero.
+    if (readIndex < inputIndex) {
+      if (writeIndex == rawPacketSize) return;
+      raw[writeIndex++] = 0;
+    }
+  }
+
+  // Bytes 1 and 2 carry the frame ID. Apply valid frames in arrival order.
+  if (writeIndex != rawPacketSize || raw[0] != protocolVersion || raw[3] != num_LED) return;
+  if (crc8(raw, rawPacketSize - 1) != raw[rawPacketSize - 1]) return;
+
+  uint8_t states[num_LED];
+  for (int i = 0; i < num_LED; i += 2) {
+    uint8_t packed = raw[headerSize + i / 2];
+    states[i] = packed >> 4;
+    states[i + 1] = packed & 0x0F;
+  }
+  for (int i = 0; i < num_LED; i++) {
+    if ((states[i] >> 2) > 2 || (states[i] & 3) > 2) return;
+  }
+  for (int i = 0; i < num_LED; i++) {
+    brightnessGrid[i] = states[i] >> 2;
+    depthGrid[i] = depthIntensity[states[i] & 3];
+  }
+}
+
 void receiveDepthData() {
   while (Serial.available()) {
-    char ch = Serial.read();
-    if (ch == '\n') {
-      inputBuffer[inputIndex] = '\0';
-
-      if (!discardInputLine && inputIndex > 0) {
-#if ARDUINOJSON_VERSION_MAJOR == 7
-        JsonDocument doc;
-#else
-        StaticJsonDocument<JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(16) + 64> doc;
-#endif
-        bool valid = !deserializeJson(doc, inputBuffer);
-        JsonArrayConst states = doc["states"].as<JsonArrayConst>();
-        valid = valid && doc["frame_id"].is<uint32_t>() && states.size() == 16;
-
-        int newValues[16];
-        for (int i = 0; valid && i < num_LED; i++) {
-          if (!states[i].is<uint8_t>()) {
-            valid = false;
-            break;
-          }
-          uint8_t state = states[i].as<uint8_t>();
-          if ((state >> 2) > 2 || (state & 3) > 2) {
-            valid = false;
-            break;
-          }
-          newValues[i] = state;
-        }
-
-        if (valid) {
-          for (int i = 0; i < num_LED; i++) {
-            brightnessGrid[i] = newValues[i] >> 2;
-            depthGrid[i] = depthIntensity[newValues[i] & 3];
-          }
-        }
-      }
-
+    uint8_t byte = Serial.read();
+    if (byte == 0) {
+      if (!discardInputPacket) applyPacket();
       inputIndex = 0;
-      discardInputLine = false;
-    }
-    else if (!discardInputLine) {
-      if (ch == '\0' || inputIndex >= (int)sizeof(inputBuffer) - 1) {
-        discardInputLine = true;  // Discard through LF, including overflow tails.
-        inputIndex = 0;
+      discardInputPacket = false;
+    } else if (!discardInputPacket) {
+      if (inputIndex < encodedPacketSize) {
+        inputBuffer[inputIndex++] = byte;
       } else {
-        inputBuffer[inputIndex++] = ch;  // Accept CRLF as JSON whitespace.
+        discardInputPacket = true;  // Ignore the rest of this frame through 0x00.
       }
     }
   }
@@ -133,6 +159,7 @@ void loop() {
     for (int col = 0; col < num_cols; col++) {
       //transposes the heat maps' output:
       int ledIndex = row + 4*col;
+      // Shared clock: each LED uses its own level's half-period, without delays.
       bool blinkOn = (millis() / blinkHalfPeriodMs[brightnessGrid[ledIndex]]) % 2 == 0;
       int visiblePercent = blinkOn ? depthGrid[ledIndex] : 0;
       setColumnBrightness(
