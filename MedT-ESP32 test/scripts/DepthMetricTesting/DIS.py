@@ -1,4 +1,4 @@
-
+#Updated to have higher FPS and show a relative average of each vector magnitude
 import cv2
 import numpy as np
 import time
@@ -21,7 +21,8 @@ GRID_ROWS = 6
 GRID_COLUMNS = 4
 
 # Dense optical flow settings
-DIS_PRESET = cv2.DISOPTICAL_FLOW_PRESET_MEDIUM
+DIS_PRESET = cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST
+
 
 FLOW_VECTOR_SPACING = 12
 
@@ -31,6 +32,8 @@ MAX_FLOW_MAGNITUDE = 30
 
 # Vector display scaling
 FLOW_DISPLAY_SCALE = 2
+PROCESS_WIDTH = 720
+PROCESS_HEIGHT = 960
 
 
 # ============================================================
@@ -39,10 +42,10 @@ FLOW_DISPLAY_SCALE = 2
 
 dis = cv2.DISOpticalFlow_create(DIS_PRESET)
 
-dis.setFinestScale(1)
-dis.setPatchSize(8)
-dis.setPatchStride(4)
-dis.setGradientDescentIterations(25)
+# dis.setFinestScale(1)
+# dis.setPatchSize(8)
+# dis.setPatchStride(4)
+# dis.setGradientDescentIterations(25)
 
 
 # ============================================================
@@ -187,13 +190,37 @@ def draw_dense_flow_grid(
 
             cv2.putText(
                 output,
-                f"{average_motion:.2f} px",
+                f"{average_motion:.2f} px mag",
                 (x1 + 5, y1 + 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (0, 255, 255),
                 1
             )
+            relative_magnitude = np.clip(average_motion / 20 * 100, 0, 100)
+            if relative_magnitude>100:100
+            # Normalize percentage to 0-1
+            t = relative_magnitude / 100.0
+
+            # light Blue -> Yellow -> Red
+            #goes blue green red
+            threshold = 0.45
+            if t < threshold/2:
+                color = (230, 216, 173)                       # Red
+                
+            elif t < threshold:
+                color = (0,200,255)
+            else:
+                color = (0,0,255)
+            cv2.putText(
+                output,
+                f"{average_motion/20*100:.2f}% relative mag",
+                (x1 + 5, y1 + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1
+                )
 
     return output
 
@@ -291,8 +318,14 @@ if not ret:
     raise SystemExit
 
 
-# Use original video resolution
+# Set processing resolution
+first_frame = cv2.resize(
+    first_frame,
+    (PROCESS_WIDTH, PROCESS_HEIGHT)
+)
+
 FRAME_HEIGHT, FRAME_WIDTH = first_frame.shape[:2]
+
 
 print("Original video resolution:")
 print(FRAME_WIDTH, "x", FRAME_HEIGHT)
@@ -353,12 +386,16 @@ while True:
         break
 
 
-    # Do not resize the video
+    # Resize video frame
+    frame = cv2.resize(
+        frame,
+        (PROCESS_WIDTH, PROCESS_HEIGHT)
+    )
+
     current_gray = cv2.cvtColor(
         frame,
         cv2.COLOR_BGR2GRAY
     )
-
     frame_count += 1
 
 
